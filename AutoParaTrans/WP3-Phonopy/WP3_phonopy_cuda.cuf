@@ -1,0 +1,244 @@
+!! FILES REQUIRED:
+!!  mesh.yaml 
+!!
+!! OUTPUT FILES:
+!!  WP3_plus.txt
+!!  WP3_minus.txt
+
+module defs_basis
+  implicit none
+  integer, parameter :: dp=kind(1.0d0)
+  real(dp), parameter :: tol8= 0.00000001_dp
+  real(dp), parameter :: pi=3.141592653589793238462643383279502884197_dp
+  real(dp), parameter :: kb=1.380648813d-23 ! J/K
+  real(dp), parameter :: hbar=1.05457172647d-22 ! J*THz 
+  real(dp), parameter :: zero=0._dp
+end module defs_basis
+
+MODULE WP3_module
+  use defs_basis
+  implicit none
+  CONTAINS
+    attributes(global) subroutine WP3_kernel(nwp3points, bandfreq_1D, WP3_plus, WP3_minus, factor, T, sigma)
+      integer, value, intent(in) :: nwp3points
+      real(dp), value, intent(in) :: factor, T, sigma
+      real(dp), dimension(nwp3points), intent(in) :: bandfreq_1D
+      real(dp), dimension(nwp3points), intent(inout) :: WP3_plus, WP3_minus
+
+      integer :: iwp3points, iwp3pointsp, iwp3pointspp
+      real(dp):: fBEp, fBEpp, WP3_temp, dfreqplus, dfreqminus
+
+      iwp3points = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+      
+
+      if (iwp3points<=nwp3points) then
+        do iwp3pointsp=1,nwp3points
+          if (abs(bandfreq_1D(iwp3pointsp)/factor).le.0.01) cycle
+          fBEp=1.0/(exp(hbar*bandfreq_1D(iwp3pointsp)/kb/T)-1.0)
+        
+          do iwp3pointspp=1,nwp3points
+            if (abs(bandfreq_1D(iwp3pointspp)/factor).le.0.01) cycle
+            dfreqplus=(bandfreq_1D(iwp3points)+bandfreq_1D(iwp3pointsp)-bandfreq_1D(iwp3pointspp))
+            if(abs(dfreqplus).le.2.0*sigma) then
+              fBEpp=1.0/(exp(hbar*bandfreq_1D(iwp3pointspp)/kb/T)-1.0)
+              WP3_temp=2.0*(fBEp-fBEpp)*exp(-1.0*dfreqplus**2/2.0/sigma/sigma)/sigma/sqrt(2.0*pi)/(bandfreq_1D(iwp3points)*bandfreq_1D(iwp3pointsp)*bandfreq_1D(iwp3pointspp))
+              WP3_plus(iwp3points)=WP3_plus(iwp3points)+WP3_temp
+            endif
+            dfreqminus=(bandfreq_1D(iwp3points)-bandfreq_1D(iwp3pointsp)-bandfreq_1D(iwp3pointspp))
+            if(abs(dfreqminus).le.2.0*sigma) then
+              fBEpp=1.0/(exp(hbar*bandfreq_1D(iwp3pointspp)/kb/T)-1.0)
+              WP3_temp=(fBEp+fBEpp+1.0)*exp(-1.0*dfreqminus**2/2.0/sigma/sigma)/sigma/sqrt(2.0*pi)/(bandfreq_1D(iwp3points)*bandfreq_1D(iwp3pointsp)*bandfreq_1D(iwp3pointspp))
+              WP3_minus(iwp3points)=WP3_minus(iwp3points)+WP3_temp
+            endif
+          enddo
+        enddo
+      endif
+    end subroutine WP3_kernel
+END MODULE WP3_module
+
+
+program WP3_phonopy
+use defs_basis
+use cudafor
+use WP3_module
+implicit none
+character*150 nomeaning,forma
+real(dp) factor,x,y,sigma,delta,freq,minq,dostemp,phonondos,bandweight,gauss
+real(dp) fBEp,fBEpp,WP3_temp,T,lowerbound,adjust,dfreqplus,dfreqminus
+integer,allocatable::weight(:)  ! weight(nqpoints)
+integer eof,i,j,k,special
+integer,allocatable::atoms(:)
+integer natoms,iatoms,nqpoints,iqpoints,nbands,ibands,satoms,ivec,ndata,idata
+integer nwp3points,iwp3points,iwp3pointsp,iwp3pointspp  ! nwp3points=nqpoints*nbands
+real(dp),allocatable::bandfreq(:,:),bandfreq_1D(:),WP3_plus(:),WP3_minus(:)
+complex(dp),allocatable::eigenvector(:,:,:,:)
+logical pband,adjustfreq,specialwp3
+
+real(dp) , device , allocatable :: d_bandfreq_1D(:) 
+real(dp) , device , allocatable :: d_WP3_plus(:)
+real(dp) , device , allocatable :: d_WP3_minus(:)
+!type(dim3) :: grid , tBlock
+
+write(*,"(A)")"Please adopt the tag --nomeshsym when generating mesh.yaml"
+
+open(unit=40,file="mesh.yaml",status="old",iostat=eof)
+if (eof/=0) stop "no mesh.yaml"
+
+do while(.true.)
+  read(40,*)nomeaning
+  if (nomeaning=="nqpoint:") then
+    backspace(40)
+    read(40,*)nomeaning,nqpoints
+  endif
+  if (nomeaning=="natom:") then
+    backspace(40)
+    read(40,*)nomeaning,natoms
+  endif
+  if (nomeaning=="weight:") exit
+enddo
+
+nbands=3*natoms
+do i=1,3
+  read(40,*)nomeaning
+enddo
+read(40,"(A15)") nomeaning
+pband=.false.
+if (nomeaning=="    eigenvector" ) pband=.true.
+
+nwp3points=nbands*nqpoints
+allocate(bandfreq(nbands,nqpoints),weight(nqpoints))
+allocate(bandfreq_1D(nwp3points),WP3_plus(nwp3points),WP3_minus(nwp3points))
+
+!write(*,"(A)") "tell me the factor of frequency (1.0 for THz, 4.1357 for meV, 33.3564 for cm-1)"
+!read(*,*,iostat=eof)factor
+factor=2*pi
+write(*,"(A)") "Tell me the sigma (e.g. 0.15) in the Gaussian function"
+read(*,*)sigma
+write(*,"(A)") "Which temperature?"
+read(*,*)T
+write(*,"(A)") "Do you want to adjust the frequency?"
+read(*,*)adjustfreq
+if(adjustfreq) then
+  write(*,"(A)")"The lower bound of frequency and the amount you want to adjust (in the unit THz)"
+  read(*,*)lowerbound,adjust
+endif
+
+rewind(40)
+!! store all the information into bandfreq, weight, and eigenvector
+iwp3points=1
+do iqpoints=1,nqpoints
+  do while(.true.)
+    read(40,*) nomeaning
+    if (nomeaning=="weight:") then
+      backspace(40)
+      exit
+    endif
+  enddo
+  read(40,*)nomeaning,weight(iqpoints)
+  read(40,*)nomeaning
+  do ibands=1,nbands
+    read(40,*)nomeaning
+    read(40,*)nomeaning,bandfreq(ibands,iqpoints)
+    bandfreq_1D(iwp3points)=bandfreq(ibands,iqpoints)
+    if(adjustfreq.and.bandfreq_1D(iwp3points).gt.lowerbound) bandfreq_1D(iwp3points)=bandfreq_1D(iwp3points)+adjust
+    iwp3points=iwp3points+1
+    if (pband) then
+      read(40,*)nomeaning
+      do iatoms=1,natoms
+        read(40,*)nomeaning
+        do ivec=1,3
+          read(40,"(9X,F18.14,1X,F18.14)") x,y
+          eigenvector(ivec,iatoms,ibands,iqpoints)=cmplx(x,y)
+        enddo         ! end the vec
+      enddo           ! end the atoms
+    endif
+  enddo             ! end the bands
+enddo               ! end the qpoints
+close(40)
+!bandfreq=bandfreq*factor
+bandfreq_1D=bandfreq_1D*factor
+
+write(*,"(A)")"T for total WP3, F for WP3 for special point"
+read(*,*)specialwp3
+
+if (specialwp3) then
+
+  WP3_plus=0.0
+  WP3_minus=0.0
+
+
+
+!tBlock = dim3(16,16,1)
+!grid = dim3(ceiling(real(nwp3points)/tBlock%x),ceiling(real(nwp3points)/tBlock%y),1)
+
+!Allocate GPU memory
+allocate(d_bandfreq_1D(nwp3points))
+allocate(d_WP3_plus(nwp3points))
+allocate(d_WP3_minus(nwp3points))
+
+!Copy data from host to device
+d_bandfreq_1D = bandfreq_1D(1:nwp3points)
+d_WP3_plus = WP3_plus(1:nwp3points)
+d_WP3_minus = WP3_minus(1:nwp3points)
+
+!Call kernel
+call WP3_kernel <<<ceiling(real(nwp3points)/512),512>>>(nwp3points, d_bandfreq_1D, d_WP3_plus, d_WP3_minus, factor, T, sigma)
+
+!copy data from device to host
+WP3_plus(1:nwp3points) = d_WP3_plus
+WP3_minus(1:nwp3points) = d_WP3_minus 
+
+!Deallocate GPU memory
+deallocate(d_bandfreq_1D, d_WP3_plus, d_WP3_minus)
+
+
+  WP3_plus=WP3_plus/2.0/nqpoints
+  WP3_minus=WP3_minus/2.0/nqpoints
+
+  open(unit=38,file="WP3_plus.txt",status="replace")
+  open(unit=39,file="WP3_minus.txt",status="replace")
+  write(38,"(A)")"freq(rad/ps)        WP3_plus(ps^4/rad^4)"
+  write(39,"(A)")"freq(rad/ps)        WP3_minus(ps^4/rad^4)"
+  do iwp3points=1,nwp3points
+    write(38,"(F15.8,5X,G15.8)")bandfreq_1D(iwp3points),WP3_plus(iwp3points)
+    write(39,"(F15.8,5X,G15.8)")bandfreq_1D(iwp3points),WP3_minus(iwp3points)
+  enddo
+  close(38)
+  close(39)
+
+else
+
+  write(*,"(A,I)") "Which point?  1  - ",nwp3points
+  read(*,*)special
+  open(unit=38,file="special_WP3_plus.txt",status="replace")
+  open(unit=39,file="special_WP3_minus.txt",status="replace")
+  write(38,"(A)")"WP3_plus(ps^4/rad^4)        q'  freq(rad/ps)        q''  freq(rad/ps)"
+  write(39,"(A)")"WP3_minus(ps^4/rad^4)       q'  freq(rad/ps)        q''  freq(rad/ps)"
+  do iwp3points=special,special
+    do iwp3pointsp=1,nwp3points
+    if (abs(bandfreq_1D(iwp3pointsp)/factor).le.0.01) cycle
+      fBEp=1.0/(exp(hbar*bandfreq_1D(iwp3pointsp)/kb/T)-1.0)
+      do iwp3pointspp=1,nwp3points
+        if (abs(bandfreq_1D(iwp3pointspp)/factor).le.0.01) cycle
+        dfreqplus=(bandfreq_1D(iwp3points)+bandfreq_1D(iwp3pointsp)-bandfreq_1D(iwp3pointspp))
+        if(abs(dfreqplus).le.2.0*sigma) then
+          fBEpp=1.0/(exp(hbar*bandfreq_1D(iwp3pointspp)/kb/T)-1.0)
+          WP3_temp=2.0*(fBEp-fBEpp)*exp(-1.0*dfreqplus**2/2.0/sigma/sigma)/sigma/sqrt(2.0*pi)/(bandfreq_1D(iwp3points)*bandfreq_1D(iwp3pointsp)*bandfreq_1D(iwp3pointspp))
+          write(38,"(G21.8,I9,F14.7,I11,F14.7)")WP3_temp/2.0/nqpoints,iwp3pointsp,bandfreq_1D(iwp3pointsp),iwp3pointspp,bandfreq_1D(iwp3pointspp)
+        endif
+        dfreqminus=(bandfreq_1D(iwp3points)-bandfreq_1D(iwp3pointsp)-bandfreq_1D(iwp3pointspp))
+        if(abs(dfreqminus).le.2.0*sigma) then
+          fBEpp=1.0/(exp(hbar*bandfreq_1D(iwp3pointspp)/kb/T)-1.0)
+          WP3_temp=(fBEp+fBEpp+1.0)*exp(-1.0*dfreqminus**2/2.0/sigma/sigma)/sigma/sqrt(2.0*pi)/(bandfreq_1D(iwp3points)*bandfreq_1D(iwp3pointsp)*bandfreq_1D(iwp3pointspp))
+          write(38,"(G21.8,I9,F14.7,I11,F14.7)")WP3_temp/2.0/nqpoints,iwp3pointsp,bandfreq_1D(iwp3pointsp),iwp3pointspp,bandfreq_1D(iwp3pointspp)
+        endif
+      enddo
+    enddo
+  enddo
+
+  close(38)
+  close(39)
+
+endif
+
+end
