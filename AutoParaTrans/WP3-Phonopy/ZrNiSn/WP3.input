@@ -1,0 +1,4 @@
+0.15    !  sigma in Gaussian function
+300     !  temperature
+F       !  not adjust frequency;  or T you should further provide the lower bound and adjusting amount
+T       !  total WP3; or F for special point. you should further provide the No. of the special point
